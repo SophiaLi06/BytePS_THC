@@ -316,11 +316,6 @@ inline void PostNcclCalls(
           (ncclRedOp_t)ncclSum, (ncclComm_t)nccl_comm,
           (cudaStream_t)nccl_stream));
       #endif
-        if(task->tensor_name[16] == 'U' && tensor->dtype() == BYTEPS_FLOAT32) {
-          // do scale finding here
-          task->scale =
-            test_norm2((void *)(out_p + nccl_rank * num_elem_per_gpu * unit_len), (size_t)num_elem_per_gpu);
-        }
     }
     if (left_elem) {
       #ifndef CPU_COMPRESS
@@ -336,11 +331,6 @@ inline void PostNcclCalls(
                            (ncclRedOp_t)ncclSum, (int)nccl_root,
                            (ncclComm_t)nccl_comm, (cudaStream_t)nccl_stream));
       #endif
-
-        if(task->tensor_name[16] == 'U' && tensor->dtype() == BYTEPS_FLOAT32 && nccl_root == nccl_rank) {
-          task->norm = 
-            test_norm2((void *)(out_p + len - left_elem * unit_len), (size_t)left_elem);
-        }
     }
   } else {
     if (num_elem_per_gpu) {
@@ -404,10 +394,6 @@ bool RunRootNcclLoopOnce() {
         if (task->device == CPU_DEVICE_ID) {
           p = (char *)(task->gpu_ptr) + offset;
         }
-        
-          if(task->tensor_name[16] == 'U' && tensor->dtype() == BYTEPS_FLOAT32) {
-            task->scale = test_norm2((void *)(p), (size_t)(num_per_gpu));
-          }
       }
     }
   }
