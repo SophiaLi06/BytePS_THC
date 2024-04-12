@@ -97,22 +97,10 @@ accuracy = []
 lr_and_loss = []
 compressor_name = "None"
 throughput_log = []
-computation_time = 0.0
-step_time = 0.0
-
 
 def exit_handler():
-    print("Total computation time: " + str(computation_time / 1000))
-    print("Total time for step function: " + str(step_time / 1000))
     print("Throughputs mean, min, max:", sum(throughput_log)/len(throughput_log), min(throughput_log), max(throughput_log))
-    if len(throughput_log) < 1000:
-        print("Complete throughput records:", throughput_log)
-    else:
-        print("sample of throughput log:", random.sample(throughput_log, 1000))
-    # save accuracy and learning rate
-    # curr_time=datetime.datetime.now().strftime("%m-%d-%Y-%H-%M-%S")
-    # with open('../example/pytorch/accuracy_and_lr_record/imagenet/topk10_'+args.net+'-'+curr_time+'.pkl', 'wb') as pkl_file:
-    #     pickle.dump(accuracy_and_lr, pkl_file)
+
 atexit.register(exit_handler)
 
 MODEL_CLASSES = {
@@ -152,8 +140,7 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
     global accuracy
     global compressor_name
     global throughput_log
-    global computation_time
-    global step_time
+
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
 
@@ -196,7 +183,7 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
     # NOTE: this is for compressing the batched gradient
     quantization_levels['batch_grads'] = args.quant_level
     # BytePS: (optional) compression algorithm. 
-    if args.new_inca:
+    if args.thc or args.new_inca:
         compression = hvd.Compression.newinca(params={'nclients': 1, 'd': pytorch_total_params_trainable, \
             'ef': args.ef, 'quantization_levels': args.quant_level, 'seed': args.new_inca_seed, \
             'overflow_frequency': args.overflow_freq, 'max_val': args.max_val, 'table_dir': args.table_dir, \
@@ -215,7 +202,7 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
             'use_bps_server': args.use_bps_server})
         compressor_name = "terngrad"
     else:
-        compression = hvd.Compression.fp16 if args.fp16_pushpull else hvd.Compression.none
+        compression = hvd.Compression.fp16 if args.fp16_pushpull else hvd.Compression.none()
         
     optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), compression=compression,\
         backward_passes_per_step=args.gradient_accumulation_steps)
@@ -296,14 +283,6 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
                 steps_trained_in_current_epoch -= 1
                 continue
 
-            # time the computation time (except step function time)
-            train_start = torch.cuda.Event(enable_timing=True)
-            train_end = torch.cuda.Event(enable_timing=True)
-            train_start.record()
-
-            # inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
-            # inputs = inputs.to(args.device)
-            # labels = labels.to(args.device)
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
@@ -340,10 +319,6 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
             else:
                 loss.backward()
 
-            train_end.record()
-            torch.cuda.synchronize()
-            computation_time += (train_start.elapsed_time(train_end))
-
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
@@ -351,47 +326,26 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 
-                step_start = torch.cuda.Event(enable_timing=True)
-                step_end = torch.cuda.Event(enable_timing=True)
-                step_start.record()
-                
                 optimizer.step()
 
-                step_end.record()
-                torch.cuda.synchronize()
-                step_time += (step_start.elapsed_time(step_end))
                 scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
 
                 if args.local_rank in [-1, 0] and global_step % args.logging_steps == 0:
-                # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if ((args.local_rank == -1 or hvd.rank() == 0) and args.evaluate_during_training):  
                         # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer, iteration="Step {}".format(global_step))
-                        # lr_and_loss.append(results["perplexity"])
                         for key, value in results.items():
                             tb_writer.add_scalar("eval_{}".format(key), value, global_step)
-                    # # Log metrics
-                    # if (
-                    #     (args.local_rank == -1 or hvd.rank() == 0) and args.evaluate_during_training
-                    # ):  # Only evaluate when single GPU otherwise metrics may not average well
-                    #     results = evaluate(args, model, tokenizer)
-                    #     # lr_and_loss.append(results["perplexity"])
-                    #     for key, value in results.items():
-                    #         tb_writer.add_scalar("eval_{}".format(key), value, global_step)
+                    
                     tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar("train_loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
-                    # tb_writer.add_scalar("train_perplexity", \
-                    #     torch.exp(torch.tensor((tr_loss - logging_loss) / args.logging_steps)), global_step)
                     logger.info("lr: %.6f", scheduler.get_lr()[0])
                     logger.info("train_loss: %.6f", (tr_loss - logging_loss) / args.logging_steps)
-                    # logger.info("train_perplexity: %s", \
-                    #     str(torch.exp(torch.tensor((tr_loss - logging_loss) / args.logging_steps))))
-                    # record lr, loss, and perplexity
+                    # record lr, loss
                     lr_and_loss.append(scheduler.get_last_lr())
                     lr_and_loss.append((tr_loss - logging_loss) / args.logging_steps)
-                    # lr_and_loss.append(torch.exp(torch.tensor((tr_loss - logging_loss) / args.logging_steps)))
                     logging_loss = tr_loss
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
@@ -422,14 +376,6 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
         accuracy.append(num_correct / num_items)
         logger.info('Accuracy %s', str(accuracy))
 
-        # # Log metrics
-        # if ((args.local_rank == -1 or hvd.rank() == 0) and args.evaluate_during_training):  
-        #     # Only evaluate when single GPU otherwise metrics may not average well
-        #     results = evaluate(args, model, tokenizer, epoch="Epoch {}".format(epoch_num))
-        #     # lr_and_loss.append(results["perplexity"])
-        #     for key, value in results.items():
-        #         tb_writer.add_scalar("eval_{}".format(key), value, global_step)
-
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
@@ -446,12 +392,6 @@ def evaluate(args, model, tokenizer, prefix="", epoch="", iteration="") -> Dict:
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
     eval_outputs_dirs = (args.output_dir, args.output_dir + "-MM") if args.task_name == "mnli" else (args.output_dir,)
-    
-    # # Get the metric function
-    # if args.task_name is not None:
-    #     metric = huggingface_evaluate.load("glue", args.task_name)
-    # else:
-    #     metric = huggingface_evaluate.load("accuracy")
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
@@ -502,30 +442,11 @@ def evaluate(args, model, tokenizer, prefix="", epoch="", iteration="") -> Dict:
                     outputs = model(**inputs)
                 tmp_eval_loss = outputs.loss
                 logits = outputs.logits
-                # tmp_eval_loss, logits = outputs[:2]
                 eval_loss += tmp_eval_loss.mean().item()
             nb_eval_steps += 1
-        #     if args.output_mode == "classification":
-        #         predictions = outputs.logits.argmax(dim=-1)
-        #     elif args.output_mode == "regression":
-        #         predictions = outputs.logits.squeeze()
-        #     references = inputs["labels"]
-        #     metric.add_batch(
-        #         predictions=predictions,
-        #         references=references,
-        #     )
-        
-        # eval_metric = metric.compute()
-        # logger.info(f"epoch {epoch}: {eval_metric}")
-        # accuracy = eval_metric['accuracy']['score']
+
             preds = logits.detach().cpu().numpy()
             out_label_ids = inputs["labels"].detach().cpu().numpy()
-            # if preds is None:
-            #     preds = logits.detach().cpu().numpy()
-            #     out_label_ids = inputs["labels"].detach().cpu().numpy()
-            # else:
-            #     preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-            #     out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
 
             if args.output_mode == "classification":
                 preds = np.argmax(preds, axis=1)
@@ -535,12 +456,6 @@ def evaluate(args, model, tokenizer, prefix="", epoch="", iteration="") -> Dict:
             num_items += preds.shape[0]
 
         eval_loss = eval_loss / nb_eval_steps
-        # if args.output_mode == "classification":
-        #     preds = np.argmax(preds, axis=1)
-        # elif args.output_mode == "regression":
-        #     preds = np.squeeze(preds)
-        # result = compute_metrics(eval_task, preds, out_label_ids)
-        # results.update(result)
 
         accuracy = num_correct / num_items
 
@@ -553,9 +468,6 @@ def evaluate(args, model, tokenizer, prefix="", epoch="", iteration="") -> Dict:
                 writer.write("%s Accuracy = %s\n" % (epoch, str(accuracy)))
             if iteration != "":
                 writer.write("%s Accuracy = %s\n" % (iteration, str(accuracy)))
-            # for key in sorted(result.keys()):
-            #     logger.info("  %s = %s", key, str(result[key]))
-            #     writer.write("%s %s = %s\n" % (epoch, key, str(result[key])))
 
     return results
 
@@ -762,8 +674,10 @@ def main():
                     help='use INCA compression with error feedback')
     parser.add_argument('--quant-level', type=int, default=16, metavar='N',
                     help='INCA quantization levels')
+    parser.add_argument('--thc', action='store_true', default=False,
+                    help='use THC compression during pushpull')
     parser.add_argument('--new-inca', action='store_true', default=False,
-                    help='use INCA compression during pushpull')
+                    help='use INCA (aka THC) compression during pushpull')
     parser.add_argument('--new-inca-seed', type=int, default=42,
                     help='random seed for new INCA')
     parser.add_argument('--overflow-freq', type=int, default=32, 

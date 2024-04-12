@@ -41,8 +41,10 @@ parser.add_argument('--ef', action='store_true', default=False,
                     help='use INCA compression with error feedback')
 parser.add_argument('--quant-level', type=int, default=16, metavar='N',
                     help='INCA quantization levels')
+parser.add_argument('--thc', action='store_true', default=False,
+                    help='use THC compression during pushpull')
 parser.add_argument('--new-inca', action='store_true', default=False,
-                    help='use INCA compression during pushpull')
+                    help='use INCA (aka THC) compression during pushpull')
 parser.add_argument('--new-inca-seed', type=int, default=42,
                     help='random seed for new INCA')
 parser.add_argument('--overflow-freq', type=int, default=32, 
@@ -73,9 +75,7 @@ if args.cuda:
     torch.cuda.set_device(bps.local_rank())
     torch.cuda.manual_seed(args.seed)
 
-# kwargs = {'num_workers': 0, 'pin_memory': False} if args.cuda else {}
 kwargs = {'num_workers': 2, 'pin_memory': True, 'persistent_workers': True} if args.cuda else {}
-# kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 
 if args.model == 'VGG11' or args.model == 'ResNet18' or args.model == 'modcnn':
     train_dataset = \
@@ -177,18 +177,6 @@ class VGG(nn.Module):
             nn.ReLU(True),
             nn.Linear(512, num_classes)
         )
-        # self.classifier = nn.Linear(512, num_classes)
-        
-        # The classifier below is for imagenet (224 / 2 / 2 / 2 / 2 / 2 = 7)
-        # self.classifier = nn.Sequential(
-        #     nn.Linear(512 * 7 * 7, 4096),
-        #     nn.ReLU(True),
-        #     nn.Dropout(),
-        #     nn.Linear(4096, 4096),
-        #     nn.ReLU(True),
-        #     nn.Dropout(),
-        #     nn.Linear(4096, num_classes),
-        # )
 
         # Initialize weights
         for m in self.modules():
@@ -201,8 +189,6 @@ class VGG(nn.Module):
         out = self.features(x)
         out = out.view(out.size(0), -1)
         out = self.classifier(out)
-        # output = F.log_softmax(out, dim=1)
-        # return output
         return out
 
     def _make_layers(self, cfg):
@@ -226,7 +212,6 @@ class ModerateCNNMNIST(nn.Module):
         super(ModerateCNNMNIST, self).__init__()
         self.conv_layer = nn.Sequential(
             # Conv Layer block 1
-            # nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1),
             nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
@@ -252,7 +237,6 @@ class ModerateCNNMNIST(nn.Module):
         self.fc_layer = nn.Sequential(
             nn.Dropout(p=0.1),
             nn.Linear(4096, 1024), # 32/2/2/2 = 4, 256 * (4*4) = 4096
-            # nn.Linear(2304, 1024), # floor(28/2/2/2) = 3, 256 * (3*3) = 2304
             nn.ReLU(inplace=True),
             nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
@@ -296,7 +280,7 @@ for param_name, _ in model.named_parameters():
 quantization_levels['batch_grads'] = args.quant_level
 
 # BytePS: (optional) compression algorithm.
-if args.new_inca:
+if args.thc or args.new_inca:
     compression = bps.Compression.newinca(params={'nclients': bps.get_num_worker(), 'd': pytorch_total_params_trainable, \
         'ef': args.ef, 'quantization_levels': args.quant_level, 'seed': args.new_inca_seed, \
         'overflow_frequency': args.overflow_freq, 'max_val': args.max_val, 'table_dir': args.table_dir, \
@@ -324,77 +308,23 @@ optimizer = bps.DistributedOptimizer(optimizer,
 bps.broadcast_parameters(model.state_dict(), root_rank=0)
 bps.broadcast_optimizer_state(optimizer, root_rank=0)
 
-computation_time = 0.0
-data_move_time = 0.0
-step_time = 0.0
-prep_time = 0.0
-batches_time = 0.0
-load_time = 0.0
 def train(epoch):
-    global computation_time
-    global step_time
-    global data_move_time
-    global prep_time
-    global batches_time
-    global load_time
-
-    prep_start = torch.cuda.Event(enable_timing=True)
-    prep_end = torch.cuda.Event(enable_timing=True)
-    prep_start.record()
 
     model.train()
     # BytePS: set epoch to sampler for shuffling.
     train_sampler.set_epoch(epoch)
-    print("train sampler set epoch")
-
-    prep_end.record()
-    torch.cuda.synchronize()
-    prep_time += (prep_start.elapsed_time(prep_end))
     
-    load_start = time.time()
     for batch_idx, (data, target) in enumerate(train_loader):
-        batch_start = time.time()
-        load_time += time.time() - load_start
         
-        # time the computation time (except step function time)
-        move_start = torch.cuda.Event(enable_timing=True)
-        move_end = torch.cuda.Event(enable_timing=True)
-        move_start.record()
         if args.cuda:
             data, target = data.cuda(), target.cuda()
-        move_end.record()
-        torch.cuda.synchronize()
-        data_move_time += (move_start.elapsed_time(move_end))
-
-        # time the computation time (except step function time)
-        if epoch > 1:
-            train_start = torch.cuda.Event(enable_timing=True)
-            train_end = torch.cuda.Event(enable_timing=True)
-            train_start.record()
         
         optimizer.zero_grad()
         output = model(data)
         loss = F.cross_entropy(output, target)
-        # loss = F.nll_loss(output, target)
         loss.backward()
 
-        if epoch > 1:
-            train_end.record()
-            torch.cuda.synchronize()
-            computation_time += (train_start.elapsed_time(train_end))
-
-        if epoch > 1:
-            step_start = torch.cuda.Event(enable_timing=True)
-            step_end = torch.cuda.Event(enable_timing=True)
-            step_start.record()
-
         optimizer.step()
-
-        if epoch > 1:
-            step_end.record()
-            torch.cuda.synchronize()
-            step_time += (step_start.elapsed_time(step_end))
-
 
         if batch_idx % args.log_interval == 0:
             # BytePS: use train_sampler to determine the number of examples in
@@ -402,10 +332,6 @@ def train(epoch):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_sampler),
                 100. * batch_idx / len(train_loader), loss.item()))
-
-        load_start = time.time()
-        
-        batches_time += time.time() - batch_start
     
 
 
@@ -459,11 +385,4 @@ for epoch in range(1, args.epochs + 1):
 
 total_time = time.time() - start_time
 print("Total Time: " + str(total_time))
-print("Total computation time (exclude first 1 epochs): " + str(computation_time / 1000))
-print("Total time for step function: " + str(step_time / 1000))
-print("Total time for data_movement: " + str(data_move_time / 1000))
-print("Total time for setting model and epochs: " + str(prep_time / 1000))
-print("Total data loading time: " + str(load_time))
-print("Total Training Batches Time: " + str(batches_time))
-print("Total Training Time (exclude first 1 epochs): " + str(train_time))
-print("Total Testing Time (exclude first 1 epochs): " + str(test_time))
+

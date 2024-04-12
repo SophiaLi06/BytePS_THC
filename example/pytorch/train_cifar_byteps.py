@@ -63,8 +63,10 @@ parser.add_argument('--ef', action='store_true', default=False,
                     help='use INCA compression with error feedback')
 parser.add_argument('--quant-level', type=int, default=16, metavar='N',
                     help='INCA quantization levels')
+parser.add_argument('--thc', action='store_true', default=False,
+                    help='use THC compression during pushpull')
 parser.add_argument('--new-inca', action='store_true', default=False,
-                    help='use INCA compression during pushpull')
+                    help='use INCA (aka THC) compression during pushpull')
 parser.add_argument('--new-inca-seed', type=int, default=42,
                     help='random seed for new INCA')
 parser.add_argument('--overflow-freq', type=int, default=32, 
@@ -110,22 +112,9 @@ train_dataset = \
     dataset('data-%d' % bps.rank(), train=True, download=True,
 			transform=transforms.Compose([
 				transforms.RandomCrop(32, padding=4),
-                # transforms.RandomHorizontalFlip(),
 				transforms.ToTensor(),
 				transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 			]))
-# Configurations from: 
-# https://github.com/weiaicunzai/pytorch-cifar100/blob/11d8418f415b261e4ae3cb1ffe20d06ec95b98e4/utils.py
-# train_dataset = \
-#     dataset('data-%d' % bps.rank(), train=True, download=True,
-# 			transform=transforms.Compose([
-# 				transforms.RandomCrop(32, padding=4),
-#                 transforms.RandomHorizontalFlip(),
-#                 transforms.RandomRotation(15),
-# 				transforms.ToTensor(),
-# 				transforms.Normalize((0.5070751592371323, 0.48654887331495095, 0.4409178433670343),
-#                  (0.2673342858792401, 0.2564384629170883, 0.27615047132568404)),
-# 			]))
 
 # BytePS: use DistributedSampler to partition the training data.
 train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -140,26 +129,12 @@ test_dataset = \
 		transforms.ToTensor(),
 		transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ]))
-# Configurations from: 
-# https://github.com/weiaicunzai/pytorch-cifar100/blob/11d8418f415b261e4ae3cb1ffe20d06ec95b98e4/utils.py
-# test_dataset = \
-#     dataset('data-%d' % bps.rank(), train=False, transform=transforms.Compose([
-# 		transforms.ToTensor(),
-# 		transforms.Normalize((0.5070751592371323, 0.48654887331495095, 0.4409178433670343),
-#          (0.2673342858792401, 0.2564384629170883, 0.27615047132568404)),
-#     ]))
 # BytePS: use DistributedSampler to partition the test data.
 test_sampler = torch.utils.data.distributed.DistributedSampler(
     test_dataset, num_replicas=bps.size(), rank=bps.rank())
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.test_batch_size,
                                           sampler=test_sampler, **kwargs)
 print("test_loader initialized")
-
-# for data, target in train_loader:
-#     pass
-
-# for data, target in test_loader:
-#     pass
 
 print("communication backend starting")
 # time.sleep(30)
@@ -169,12 +144,9 @@ affinity = os.sched_getaffinity(0)
 print("Process is eligible to run on:", affinity)
 
 if args.net == 'ResNet18':
-	# net = models.resnet18
     model = ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, color_channels=3)
-    # model = model_factories.ResNet18(num_classes=num_classes, color_channels=3)
 elif args.net == 'ResNet50':
     model = ResNet(BottleNeck, [3, 4, 6, 3], num_classes=num_classes, color_channels=3)
-    # model = model_factories.ResNet50(num_classes=num_classes, color_channels=3)
 elif args.net == 'VGG16':
     model = VGG('VGG16', num_classes=num_classes)
 elif args.net == 'VGG19':
@@ -183,8 +155,6 @@ elif args.net == 'VGG19':
 if args.cuda:
     # Move model to GPU.
     model.cuda()
-    # model = nn.DataParallel(model, device_ids = [ 0, 1]).cuda()
-    # cudnn.benchmark = True
 
 # BytePS: scale learning rate by the number of GPUs.
 optimizer = optim.SGD(model.parameters(), lr=args.lr,
@@ -203,7 +173,7 @@ for param_name, _ in model.named_parameters():
 quantization_levels['batch_grads'] = args.quant_level
 
 # BytePS: (optional) compression algorithm.
-if args.new_inca:
+if args.thc or args.new_inca:
     compression = bps.Compression.newinca(params={'nclients': 1, 'd': pytorch_total_params_trainable, \
         'ef': args.ef, 'quantization_levels': args.quant_level, 'seed': args.new_inca_seed, \
         'overflow_frequency': args.overflow_freq, 'max_val': args.max_val, 'table_dir': args.table_dir, \
@@ -215,7 +185,7 @@ elif args.terngrad:
     compression = bps.Compression.terngrad(params={'d': pytorch_total_params_trainable,\
         'ef': args.ef, 'use_bps_server': args.use_bps_server})
 else:
-    compression = bps.Compression.fp16 if args.fp16_pushpull else bps.Compression.none
+    compression = bps.Compression.fp16 if args.fp16_pushpull else bps.Compression.none()
 
 # BytePS: wrap optimizer with DistributedOptimizer.
 optimizer = bps.DistributedOptimizer(optimizer,
@@ -231,78 +201,20 @@ bps.broadcast_parameters(model.state_dict(), root_rank=0)
 bps.broadcast_optimizer_state(optimizer, root_rank=0)
 print("ready for training")
 
-# state_dict = optimizer.state_dict()
-
-# # Newly created optimizers will not have their state initialized, so
-# # do that initialization here
-# if len(state_dict['state']) == 0:
-#     for group in optimizer.param_groups:
-#         for p in group['params']:
-#             p.grad = p.data.new(p.size()).zero_()
-#     # This function accepts a torch.optim.Optimizer or a DistributedOptimizer
-#     # wrapped around a torch optimizer. Calling step() with a DistributedOptimizer
-#     # forces push_pull on all model parameters, which will result in deadlock
-#     # unless every rank calls step(). Therefore, to finish state initialization
-#     # only call optimizer.step() with a torch.optim.Optimizer.
-#     if optimizer.__module__ == bps.DistributedOptimizer.__module__:
-#         super(optimizer.__class__, optimizer).step()
-#     else:
-#         optimizer.step()
-#     state_dict = optimizer.state_dict()
-
-
-computation_time = 0.0
-data_move_time = 0.0
-step_time = 0.0
-prep_time = 0.0
-batches_time = 0.0
-load_time = 0.0
-
 accuracy_and_lr = []
 
 def train(epoch):
-    global computation_time
-    global step_time
-    global data_move_time
-    global prep_time
-    global batches_time
-    global load_time
 
     train_accuracy = 0.0
-
-    # prep_start = torch.cuda.Event(enable_timing=True)
-    # prep_end = torch.cuda.Event(enable_timing=True)
-    # prep_start.record()
 
     model.train()
     # BytePS: set epoch to sampler for shuffling.
     train_sampler.set_epoch(epoch)
-    print("train sampler set epoch")
-
-    # prep_end.record()
-    # torch.cuda.synchronize()
-    # prep_time += (prep_start.elapsed_time(prep_end))
-
     
-    load_start = time.time()
     for batch_idx, (data, target) in enumerate(train_loader):
-        batch_start = time.time()
-        load_time += time.time() - load_start
-        
-        # time the computation time (except step function time)
-        # move_start = torch.cuda.Event(enable_timing=True)
-        # move_end = torch.cuda.Event(enable_timing=True)
-        # move_start.record()
+
         if args.cuda:
             data, target = data.cuda(), target.cuda()
-        # move_end.record()
-        # torch.cuda.synchronize()
-        # data_move_time += (move_start.elapsed_time(move_end))
-
-        # time the computation time (except step function time)
-        train_start = torch.cuda.Event(enable_timing=True)
-        train_end = torch.cuda.Event(enable_timing=True)
-        train_start.record()
 
         optimizer.zero_grad()
         output = model(data)
@@ -311,19 +223,7 @@ def train(epoch):
         # loss = F.nll_loss(output, target)
         loss.backward()
 
-        train_end.record()
-        torch.cuda.synchronize()
-        computation_time += (train_start.elapsed_time(train_end))
-
-        step_start = torch.cuda.Event(enable_timing=True)
-        step_end = torch.cuda.Event(enable_timing=True)
-        step_start.record()
-
         optimizer.step()
-
-        step_end.record()
-        torch.cuda.synchronize()
-        step_time += (step_start.elapsed_time(step_end))
 
         pred = output.data.max(1, keepdim=True)[1]
         train_accuracy += pred.eq(target.data.view_as(pred)).cpu().float().sum()
@@ -335,10 +235,6 @@ def train(epoch):
                 epoch, batch_idx * len(data), len(train_sampler),
                 100. * batch_idx / len(train_loader), loss.item()))
             print(time.time())
-        
-        batches_time += time.time() - batch_start
-
-        load_start = time.time()
 
     train_accuracy /= len(train_sampler)
     if bps.rank() == 0:

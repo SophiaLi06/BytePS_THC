@@ -86,51 +86,12 @@ accuracy = []
 lr_and_loss = []
 compressor_name = "None"
 throughput_log = []
-computation_time = 0.0
-step_time = 0.0
-
 
 def exit_handler():
-    print("Total computation time: " + str(computation_time / 1000))
-    print("Total time for step function: " + str(step_time / 1000))
     print("Throughputs mean, min, max:", sum(throughput_log)/len(throughput_log), min(throughput_log), max(throughput_log))
-    if len(throughput_log) < 1000:
-        print("Complete throughput records:", throughput_log)
-    else:
-        print("sample of throughput log:", random.sample(throughput_log, 1000))
-    # save accuracy and learning rate
-    # curr_time=datetime.datetime.now().strftime("%m-%d-%Y-%H-%M-%S")
-    # with open('../example/pytorch/accuracy_and_lr_record/imagenet/topk10_'+args.net+'-'+curr_time+'.pkl', 'wb') as pkl_file:
-    #     pickle.dump(accuracy_and_lr, pkl_file)
+
 atexit.register(exit_handler)
 
-# ALL_MODELS = sum(
-#     (
-#         tuple(conf.pretrained_config_archive_map.keys())
-#         for conf in (
-#             BertConfig,
-#             XLNetConfig,
-#             XLMConfig,
-#             RobertaConfig,
-#             DistilBertConfig,
-#             XLMRobertaConfig,
-#             FlaubertConfig,
-#         )
-#     ),
-#     (),
-# )
-
-# MODELS = [(BertModel,       BertTokenizer,       'bert-base-uncased'),
-#           (OpenAIGPTModel,  OpenAIGPTTokenizer,  'openai-gpt'),
-#           (GPT2Model,       GPT2Tokenizer,       'gpt2'),
-#           (CTRLModel,       CTRLTokenizer,       'ctrl'),
-#           (TransfoXLModel,  TransfoXLTokenizer,  'transfo-xl-wt103'),
-#           (XLNetModel,      XLNetTokenizer,      'xlnet-base-cased'),
-#           (XLMModel,        XLMTokenizer,        'xlm-mlm-enfr-1024'),
-#           (DistilBertModel, DistilBertTokenizer, 'distilbert-base-uncased'),
-#           (RobertaModel,    RobertaTokenizer,    'roberta-base'),
-#           (XLMRobertaModel, XLMRobertaTokenizer, 'xlm-roberta-base'),
-#          ]
 MODEL_CLASSES = {
     "bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
     "xlnet": (XLNetConfig, XLNetForSequenceClassification, XLNetTokenizer),
@@ -165,8 +126,7 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
     global accuracy
     global compressor_name
     global throughput_log
-    global computation_time
-    global step_time
+
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
 
@@ -209,7 +169,7 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
     # NOTE: this is for compressing the batched gradient
     quantization_levels['batch_grads'] = args.quant_level
     # BytePS: (optional) compression algorithm. 
-    if args.new_inca:
+    if args.thc or args.new_inca:
         compression = hvd.Compression.newinca(params={'nclients': 1, 'd': pytorch_total_params_trainable, \
             'ef': args.ef, 'quantization_levels': args.quant_level, 'seed': args.new_inca_seed, \
             'overflow_frequency': args.overflow_freq, 'max_val': args.max_val, 'table_dir': args.table_dir, \
@@ -228,7 +188,7 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
             'use_bps_server': args.use_bps_server})
         compressor_name = "terngrad"
     else:
-        compression = hvd.Compression.fp16 if args.fp16_pushpull else hvd.Compression.none
+        compression = hvd.Compression.fp16 if args.fp16_pushpull else hvd.Compression.none()
         
     optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), compression=compression,\
         backward_passes_per_step=args.gradient_accumulation_steps)
@@ -309,13 +269,6 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
                 steps_trained_in_current_epoch -= 1
                 continue
 
-            train_start = torch.cuda.Event(enable_timing=True)
-            train_end = torch.cuda.Event(enable_timing=True)
-            train_start.record()
-
-            # inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
-            # inputs = inputs.to(args.device)
-            # labels = labels.to(args.device)
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
@@ -348,10 +301,6 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
             else:
                 loss.backward()
 
-            train_end.record()
-            torch.cuda.synchronize()
-            computation_time += (train_start.elapsed_time(train_end))
-
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
@@ -359,47 +308,27 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-                step_start = torch.cuda.Event(enable_timing=True)
-                step_end = torch.cuda.Event(enable_timing=True)
-                step_start.record()
-
                 optimizer.step()
 
-                step_end.record()
-                torch.cuda.synchronize()
-                step_time += (step_start.elapsed_time(step_end))
                 scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
 
                 if args.local_rank in [-1, 0] and global_step % args.logging_steps == 0:
-                # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if ((args.local_rank == -1 or hvd.rank() == 0) and args.evaluate_during_training):  
                         # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer, iteration="Step {}".format(global_step))
-                        # lr_and_loss.append(results["perplexity"])
                         for key, value in results.items():
                             tb_writer.add_scalar("eval_{}".format(key), value, global_step)
-                    # # Log metrics
-                    # if (
-                    #     (args.local_rank == -1 or hvd.rank() == 0) and args.evaluate_during_training
-                    # ):  # Only evaluate when single GPU otherwise metrics may not average well
-                    #     results = evaluate(args, model, tokenizer)
-                    #     # lr_and_loss.append(results["perplexity"])
-                    #     for key, value in results.items():
-                    #         tb_writer.add_scalar("eval_{}".format(key), value, global_step)
+
                     tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar("train_loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
-                    # tb_writer.add_scalar("train_perplexity", \
-                    #     torch.exp(torch.tensor((tr_loss - logging_loss) / args.logging_steps)), global_step)
                     logger.info("lr: %.6f", scheduler.get_lr()[0])
                     logger.info("train_loss: %.6f", (tr_loss - logging_loss) / args.logging_steps)
-                    # logger.info("train_perplexity: %s", \
-                    #     str(torch.exp(torch.tensor((tr_loss - logging_loss) / args.logging_steps))))
-                    # record lr, loss, and perplexity
+
+                    # record lr, loss
                     lr_and_loss.append(scheduler.get_last_lr())
                     lr_and_loss.append((tr_loss - logging_loss) / args.logging_steps)
-                    # lr_and_loss.append(torch.exp(torch.tensor((tr_loss - logging_loss) / args.logging_steps)))
                     logging_loss = tr_loss
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
@@ -430,14 +359,6 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
         accuracy.append(num_correct / num_items)
         logger.info('Accuracy %s', str(accuracy))
 
-        # # Log metrics
-        # if ((args.local_rank == -1 or hvd.rank() == 0) and args.evaluate_during_training):  
-        #     # Only evaluate when single GPU otherwise metrics may not average well
-        #     results = evaluate(args, model, tokenizer, epoch="Epoch {}".format(epoch_num))
-        #     # lr_and_loss.append(results["perplexity"])
-        #     for key, value in results.items():
-        #         tb_writer.add_scalar("eval_{}".format(key), value, global_step)
-
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
@@ -463,9 +384,6 @@ def evaluate(args, model, tokenizer, prefix="", epoch="", iteration="") -> Dict:
             os.makedirs(eval_output_dir, exist_ok=True)
 
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-        # Note that DistributedSampler samples randomly
-
-        # eval_sampler = DistributedSampler(eval_dataset, num_replicas=hvd.size(), rank=hvd.rank())
         eval_sampler = SequentialSampler(eval_dataset)
         eval_dataloader = DataLoader(
             eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size
@@ -570,9 +488,6 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         if args.local_rank in [-1, 0]:
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
-
-    # if args.local_rank == 0 and not evaluate:
-    #     torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Convert to Tensors and build dataset
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
@@ -727,9 +642,11 @@ def main():
                     help='use INCA compression with error feedback')
     parser.add_argument('--quant-level', type=int, default=16, metavar='N',
                     help='INCA quantization levels')
-    ### new INCA parameters
-    parser.add_argument('--new-inca', action='store_true', default=False,
+    ### THC (aka new INCA) parameters
+    parser.add_argument('--thc', action='store_true', default=False,
                     help='use INCA compression during pushpull')
+    parser.add_argument('--new-inca', action='store_true', default=False,
+                    help='use INCA (aka THC) compression during pushpull')
     parser.add_argument('--new-inca-seed', type=int, default=42,
                     help='random seed for new INCA')
     parser.add_argument('--overflow-freq', type=int, default=32, 
@@ -843,11 +760,6 @@ def main():
         logger.info("Training new model from scratch")
         model = model_class(config=config)
     model.config.pad_token_id = model.config.eos_token_id
-    # if tokenizer.pad_token is None:
-    #     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    #     model.resize_token_embeddings(len(tokenizer))
-    # if args.local_rank == 0:
-    #     torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     model.to(args.device)
 
@@ -865,7 +777,6 @@ def main():
 
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
-        # lr_and_loss.append(tr_loss)
 
     # Saving best-practices: if you use save_pretrained for the model and tokenizer, you can reload them using from_pretrained()
     if args.do_train and (args.local_rank == -1 or hvd.rank() == 0):
@@ -891,9 +802,7 @@ def main():
         GPT2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         tokenizer.pad_token = GPT2_tokenizer.eos_token
         model.config.pad_token_id = model.config.eos_token_id
-        # if tokenizer.pad_token is None:
-        #     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        #     model.resize_token_embeddings(len(tokenizer))
+
         model.to(args.device)
 
     # Evaluation
@@ -903,9 +812,7 @@ def main():
         GPT2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         tokenizer.pad_token = GPT2_tokenizer.eos_token
         model.config.pad_token_id = model.config.eos_token_id
-        # if tokenizer.pad_token is None:
-        #     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        #     model.resize_token_embeddings(len(tokenizer))
+
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
             checkpoints = list(
