@@ -40,7 +40,7 @@ namespace server {
 #define DEBUG_PRINT_TENSOR_VALUE(X) (*((float *)(X) + 0))
 #define DEBUG_PRINT_TENSOR_ADDRESS(X) (reinterpret_cast<uint64_t>(X))
 
-#define PS_OVERHEAD
+// #define PS_OVERHEAD
 
 using namespace ps;
 

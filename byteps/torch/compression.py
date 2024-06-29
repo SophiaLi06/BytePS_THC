@@ -373,10 +373,8 @@ class Hadamard:
         
         vec = self.hadamard(vec)
         vec = vec * self.random_diagonal[:vec.numel()]
-        # vec = vec * self.random_diagonal
         
         return vec
-        # return vec[:self.d]
 
 
 class NewINCACompressor(Compressor):
@@ -409,6 +407,7 @@ class NewINCACompressor(Compressor):
 
         if self.ef:
             self.errors = {}
+        self.preprocess_holder = {}
 
         self.fn_prefix = []
 
@@ -487,14 +486,19 @@ class NewINCACompressor(Compressor):
 
         return X, scale
 
+    def update_record(self, tensor, name):
+        if self.ef:
+            self.preprocess_holder[name] = tensor.clone() + self.errors.get(name, 0)
+        else:
+            self.preprocess_holder[name] = tensor.clone()
+        return self.preprocess_holder[name].norm(2).item()
 
     """precompression happen in parallel with max info exchanging"""
-    def precompress(self, tensor, name):
+    def precompress(self, name):
         """Returns the tensor unmodified."""
+        tensor = self.preprocess_holder[name]
         if not tensor.is_cuda:
-            print("WARNING: input tensor of INCA compress is not GPU tensor")
-
-        tensor = tensor.view(-1)
+            print("WARNING: input tensor of THC compress is not GPU tensor")
 
         # pad tensor here
         dim = tensor.numel()
@@ -509,18 +513,14 @@ class NewINCACompressor(Compressor):
         if self.ef:
             self.errors[name] = tensor.clone()
 
-        return self.hadamard.rht(tensor)
+        self.preprocess_holder[name] = self.hadamard.rht(tensor)
     
     """compression."""
-    def compress(self, tensor, name, info=None):
+    def compress(self, name, info=None):
         """Returns the tensor unmodified."""
+        tensor = self.preprocess_holder[name]
         if not tensor.is_cuda:
-            print("WARNING: input tensor of INCA compress is not GPU tensor")
-
-        tensor = tensor.view(-1)
-
-        # pad tensor here
-        dim = tensor.numel()
+            print("WARNING: input tensor of THC compress is not GPU tensor")
 
         if info['max_norm'] == 0.0:
             tensor.zero_()
@@ -573,6 +573,235 @@ class NewINCACompressor(Compressor):
         
 
         return tensor
+    
+class INCACompressor(Compressor):
+    def __init__(self, params):
+        
+        self.use_bps_server = params.get('use_bps_server', True)
+        self.use_compressor_list = False
+        self.device = params.get('device', 'cuda') 
+        self.d = params['d']
+
+        if self.d > (8*2**20):
+            self.compressor_num = self.d // (8*2**20)
+            self.d = (8*2**20)
+            self.use_compressor_list = True
+
+        self.seed = params.get('seed', 42)
+        
+        self.prng = torch.Generator(device=self.device)
+        self.prng.manual_seed(self.seed)
+        
+        self.rotation_prng = torch.Generator(device=self.device)
+                
+        self.ef = params.get('ef', True)
+        self.preprocess_holder = {}
+        self.rotation = params.get('rotation', True)
+
+        if self.rotation:
+            self.times = params['partial_rotation_times']
+        
+        self.quantization_levels = params.get('quantization_levels', {})
+
+        if self.ef:
+            self.errors = {}
+        
+        self.norm_normalization = params.get('norm_normalization', False)
+        if self.norm_normalization:
+            self.per_coordinate_overflow_prob = params.get('per_coordinate_overflow_prob', 0.0001)
+        else:
+            self.percentile = params['percentile']
+
+        self.nclients = params.get('nclients', 10)
+
+        print("quantization levels", self.quantization_levels)
+            
+    def hadamard(self, vec):
+
+        if not vec.is_cuda:
+            print("WARNING: vec not a GPU tensor in hadamard") 
+        
+        return (hadamard_cuda.hadamard_transform(vec, self.times) / np.sqrt(2 ** self.times)).view(-1)
+
+    def random_diagonal(self, size, seed):
+        
+        self.rotation_prng.manual_seed(seed)
+        result = 2 * torch.bernoulli(torch.ones(size=(size,), device=self.device) / 2, generator=self.rotation_prng) - 1
+
+        return result
+
+    def randomized_hadamard_transform(self, vec, seed):
+
+        if not vec.is_cuda:
+            print("WARNING: input vec of randomized_hadamard_transform is not GPU tensor")
+
+        dim = vec.numel()
+        
+        if not dim & (dim - 1) == 0:
+            
+            padded_dim = int(2**(np.ceil(np.log2(dim))))
+            padded_vec = torch.zeros(padded_dim, device=self.device)
+            padded_vec[:dim] = vec
+            
+            temp = self.random_diagonal(padded_vec.numel(), seed)
+            padded_vec = padded_vec * temp
+            padded_vec = self.hadamard(padded_vec)
+            
+            if not padded_vec.is_cuda:
+                print("WARNING: output vec of randomized_hadamard_transform is not GPU tensor")
+            return padded_vec
+        
+        else:   
+            
+            temp = self.random_diagonal(vec.numel(), seed)
+            vec = vec * temp
+            vec = self.hadamard(vec)
+            if not vec.is_cuda:
+                print("WARNING: output vec of randomized_hadamard_transform is not GPU tensor")
+            return vec
+        
+    def inverse_randomized_hadamard_transform(self, vec, seed, d):
+        
+        vec = self.hadamard(vec)
+        temp = self.random_diagonal(vec.numel(), seed)
+        vec = vec * temp
+        
+        return vec
+    
+    def norm_stochastic_quantization(self, params):
+        vec = params['vec']
+        max_norm = params['max_norm']
+        quantization_levels = params['quantization_levels']
+        
+        cloned_vec = vec.clone()
+
+        if not cloned_vec.is_cuda:
+            print("WARNING: cloned_vec not a GPU tensor") 
+        
+        dim = cloned_vec.numel() ### might be padded -> self.d might be wrong
+        
+        # max_coordinate = norm.isf(self.per_coordinate_overflow_prob , scale=(max_norm/np.sqrt(dim)))
+        max_coordinate = norm.isf(self.per_coordinate_overflow_prob , scale=(max_norm/np.sqrt(dim)).cpu())
+        min_coordinate = -max_coordinate
+                
+        delta = (max_coordinate - min_coordinate) / (quantization_levels - 1)
+        
+        overflow_p = ((cloned_vec > max_coordinate).sum() + (cloned_vec < min_coordinate).sum()) / float(dim)
+        if not self.ef and overflow_p > 0:
+            warnings.warn('quantization overflow with no error feedback detected: {}% overflow'.format(overflow_p))
+
+        cloned_vec = (cloned_vec - min_coordinate) / delta
+        cloned_vec = torch.clamp(cloned_vec, min=0, max=quantization_levels-1)
+        cloned_vec = torch.floor(cloned_vec) + torch.bernoulli(cloned_vec-torch.floor(cloned_vec), generator=self.prng)   
+        if not cloned_vec.is_cuda:
+            print("WARNING: cloned_vec not a GPU tensor after norm quantization") 
+                                    
+        return cloned_vec, min_coordinate, delta
+
+    def update_record(self, tensor, name):
+        if self.ef:
+            self.preprocess_holder[name] = tensor.clone() + self.errors.get(name, 0)
+        else:
+            self.preprocess_holder[name] = tensor.clone()
+        return self.preprocess_holder[name].norm(2).item()
+    
+    """precompression happen in parallel with max info exchanging"""
+    def precompress(self, name):
+        """Returns the tensor unmodified."""
+        tensor = self.preprocess_holder[name]
+        if not tensor.is_cuda:
+            print("WARNING: input tensor of UHC compress is not GPU tensor")
+
+        dim = tensor.numel()
+        
+        if not dim & (dim - 1) == 0:
+            padded_dim = int(2**(np.ceil(np.log2(dim))))
+            padded_vec = torch.zeros(padded_dim, device=self.device)
+            padded_vec[:dim] = tensor
+            tensor = padded_vec
+            print("WARNING: padding vector in compress", name, dim, padded_dim-dim)
+
+        if self.ef:
+            self.errors[name] = tensor.clone()
+
+        self.preprocess_holder[name] = self.randomized_hadamard_transform(tensor, self.seed)
+    
+    """compression."""
+    def compress(self, name, info=None):
+        """Returns the tensor unmodified."""
+
+        tensor = self.preprocess_holder[name]
+        if not tensor.is_cuda:
+            print("WARNING: input tensor of INCA compress is not GPU tensor")
+        orig_size = tensor.size()
+        max_norm = info['max_norm']
+        if info['max_norm'] == 0.0:
+            tensor.zero_()
+            min_coordinate = 0.0
+            delta = 1.0
+        else:
+            params = {}
+            params['quantization_levels'] = self.quantization_levels.get(name, 16)
+            d = tensor.numel()
+
+            sq_func = self.norm_stochastic_quantization
+            params['max_norm'] = max_norm
+
+            if self.ef:
+                
+                if self.rotation:
+
+                    # compress gradient
+                    params['vec'] = tensor
+                    tensor, min_coordinate, delta = sq_func(params)
+
+                    # update errors
+                    temp2 = self.inverse_randomized_hadamard_transform(min_coordinate + tensor * delta, self.seed, d)
+                    self.errors[name] -= temp2
+
+                else:
+
+                    # compress gradient
+                    params['vec'] = tensor
+                    tensor, min_coordinate, delta = sq_func(params)
+
+                    # update errors
+                    self.errors[name] -= (min_coordinate + tensor * delta)
+
+            else:
+                
+                params['vec'] = tensor
+                tensor, min_coordinate, delta = sq_func(params)
+
+        if not tensor.is_cuda:
+            print("WARNING: output tensor of INCA compress is not GPU tensor")
+
+        return tensor, {'name': name, 'min_coordinate': min_coordinate, 'delta': delta, 'size': orig_size}
+
+    """Upcast the tensor."""
+    def decompress(self, tensor, ctx):
+        """Returns the tensor unmodified."""
+        if not tensor.is_cuda:
+            print("WARNING: input tensor of UHC decompress is not GPU tensor")
+
+        min_coordinate = ctx['min_coordinate']
+        delta = ctx['delta']
+        tensor =  min_coordinate + (tensor / self.nclients) * delta
+        tensor = tensor.view(-1)
+
+        # Find the number of elements in the original tensor
+        d = 1
+        for width in ctx['size']:
+            d *= width
+
+        if self.rotation:
+            tensor = self.inverse_randomized_hadamard_transform(tensor, self.seed, d)
+
+
+        if not tensor.is_cuda:
+            print("WARNING: output tensor of INCA decompress is not GPU tensor")
+
+        return tensor
 
 class FP16Compressor(Compressor):
     """Compress all floating point gradients to 16-bit."""
@@ -605,6 +834,9 @@ class Compression(object):
 
     """Compress all gradients using new INCA."""
     newinca = NewINCACompressor
+
+    """Compress all gradients using INCA."""
+    inca = INCACompressor
 
     """Compress all floating point gradients to 16-bit."""
     fp16 = FP16Compressor

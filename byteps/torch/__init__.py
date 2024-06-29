@@ -56,6 +56,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._compressor_name = "inca"
             self._use_compressor_list = self._compression.use_compressor_list
             self._compression.nclients = self.num_workers
+        elif isinstance(self._compression, Compression.inca):
+            print("use old INCA compression")
+            self._compressor_name = "oldinca"
+            self._use_compressor_list = self._compression.use_compressor_list
+            self._compression.nclients = self.num_workers
         elif isinstance(self._compression, Compression.dgc):
             print("use DGC compression")
             self._compressor_name = "dgc"
@@ -70,6 +75,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._compression.nclients = self.num_workers
         else:
             print("use no compression")
+            self._compression = Compression.none()
             self._compressor_name = "none"
         if named_parameters is not None:
             named_parameters = list(named_parameters)
@@ -86,13 +92,15 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         bound = get_partition_bound() // 4
         print("Partition bound: ", bound)
         if self._total_param <= bound:
-            if isinstance(self._compression, Compression.newinca):
+            if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.inca):
                 length_with_pad = int(2**(np.ceil(np.log2(self._total_param))))
                 self._total_param = length_with_pad
             if isinstance(self._compression, Compression.none):
                 self.uncompressed_batch_tensors.append(torch.zeros(self._total_param).cuda())
+                init_declared_tensor("Gradient.Uncompress_batched_0", self._total_param)
             self.slice_size.append(self._total_param)
-            if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.terngrad):
+            if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.inca)\
+                  or isinstance(self._compression, Compression.terngrad):
                 self.compressed_batch_tensors.append((torch.zeros(self._total_param).cuda()).to(torch.uint8))
                 self.max_info_tensor.append(torch.zeros(8*8+8).cuda())
                 init_declared_tensor("Gradient.Compress_batched_0", self._total_param)
@@ -104,8 +112,10 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             for i in range(0, self._total_param // bound):
                 if isinstance(self._compression, Compression.none):
                     self.uncompressed_batch_tensors.append(torch.zeros(bound).cuda())
+                    init_declared_tensor("Gradient.Uncompress_batched_{}".format(i), bound)
                 self.slice_size.append(bound)
-                if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.terngrad):
+                if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.inca)\
+                      or isinstance(self._compression, Compression.terngrad):
                     self.compressed_batch_tensors.append((torch.zeros(bound).cuda()).to(torch.uint8))
                     self.max_info_tensor.append(torch.zeros(8*8+8).cuda())
                     init_declared_tensor("Gradient.Compress_batched_{}".format(i), bound)
@@ -114,24 +124,22 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     init_declared_tensor("Gradient.Sparsek_batched_{}".format(i), bound)
             # make sure that the last tensor's length is still divisible by 8
             length_with_pad = int(2**(np.ceil(np.log2(self._total_param % bound))))
-            print("padding size:", length_with_pad - self._total_param % bound, "previous total param:", self._total_param, "bound:", bound)
             self._total_param += length_with_pad - self._total_param % bound
             if isinstance(self._compression, Compression.none):
                 self.uncompressed_batch_tensors.append(torch.zeros(length_with_pad).cuda())
+                init_declared_tensor("Gradient.Uncompress_batched_{}".format(len(self.slice_size)), length_with_pad)
             self.slice_size.append(length_with_pad)
-            if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.terngrad):
+            if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.inca)\
+                  or isinstance(self._compression, Compression.terngrad):
                 self.compressed_batch_tensors.append((torch.zeros(length_with_pad).cuda()).to(torch.uint8))
                 self.max_info_tensor.append(torch.zeros(8*8+8).cuda())
                 init_declared_tensor("Gradient.Compress_batched_{}".format(len(self.slice_size)-1), length_with_pad)
             elif isinstance(self._compression, Compression.topk) or isinstance(self._compression, Compression.dgc):
                 self.compressed_batch_tensors.append(torch.zeros(2*int(length_with_pad * self._compression.kp)).cuda())
                 init_declared_tensor("Gradient.Sparsek_batched_{}".format(len(self.slice_size)-1), length_with_pad)
-            
-        
-        for i in range(len(self.uncompressed_batch_tensors)):
-            declare("Gradient.Uncompress_batched_{}".format(i))
 
-        if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.terngrad):
+        if isinstance(self._compression, Compression.newinca) or isinstance(self._compression, Compression.inca)\
+              or isinstance(self._compression, Compression.terngrad):
             self.max_info_tensor = torch.cat(self.max_info_tensor)
 
         self._enable_async = (int(os.getenv('BYTEPS_ENABLE_ASYNC', 0)) != 0)
@@ -222,12 +230,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     self._grad_accs.append(grad_acc)
     
     def _aftercompress_push_pull_grad_async(self, tensor, index):
-        self.compressed_batch_tensors[index].zero_()
-        self.compressed_batch_tensors[index] = tensor.to(torch.uint8)
         # NOTE: we don't average here because data are of torch.uint8 and would got rounded down
-        handle = byteps_push_pull(self.compressed_batch_tensors[index], average=False,\
+        handle = byteps_push_pull(tensor.to(torch.uint8), average=False,\
                         name="Gradient.Compress_batched_{}".format(index), compressor_name=self._compressor_name)
-
         return handle
 
     def _push_pull_grad_async(self, p):
@@ -332,29 +337,26 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         if len(grads) < self._total_param:
             grads = torch.cat([grads, torch.zeros(self._total_param-len(grads)).cuda()])
 
-        if isinstance(self._compression, Compression.newinca):
+        if isinstance(self._compression, Compression.newinca) \
+            or isinstance(self._compression, Compression.inca):
 
             norm_vals = []
             offset = 0
             
             for i in range(len(self.slice_size)):
                 slice_size = self.slice_size[i]
-                if self._compression.ef:
-                    grads[offset:offset + slice_size] += \
-                        self._compression.errors.get("batch_grads_{i}".format(i=i), 0)
-                norm_vals.append(grads[offset:offset + slice_size].norm(2).item())
+                norm_vals.append(self._compression.update_record(grads[offset:offset + slice_size], 
+                                                                 "batch_grads_{i}".format(i=i)))
                 offset += slice_size
                 
             max_info_handle = self._push_pull_max_info(norm_vals)
             # do tensor rotation in parallel
-            batch_compressed = []
             offset = 0
             if not grads.is_cuda:
                 print("WARNING: grad to compress is not on CUDA")
             for i in range(len(self.slice_size)):
                 slice_size = self.slice_size[i]
-                batch_compressed.append(self._compression.precompress(grads[offset:offset + slice_size],\
-                                                                    "batch_grads_{i}".format(i=i)))
+                self._compression.precompress("batch_grads_{i}".format(i=i))
                 offset += slice_size
             max_info_output = synchronize(max_info_handle)
 
@@ -372,7 +374,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             for i in range(len(self.slice_size)):
                 slice_size = self.slice_size[i]
                 compressed_slice, ctx = self._compression.compress(\
-                    batch_compressed[i],"batch_grads_{i}".format(i=i), \
+                    "batch_grads_{i}".format(i=i), \
                     {'max_norm':max_norms[i][self.local_rank], "dim":slice_size})
                 compress_batch_handles.append(self._aftercompress_push_pull_grad_async(compressed_slice, i))
                 contexts.append(ctx)

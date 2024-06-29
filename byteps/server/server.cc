@@ -505,7 +505,6 @@ void BytePSHandler(const ps::KVMeta& req_meta,
     auto recved = reinterpret_cast<char*>(req_data.vals.data());
 
     if (!stored->tensor) { //initialize the buffer
-      printf("Push request of key %d and len %d\n", key, len);
       auto updates = GetUpdateBuf(key);
       if (sync_mode_) {
         updates->merged.len = len;

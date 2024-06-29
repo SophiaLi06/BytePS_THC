@@ -842,7 +842,7 @@ bool RunPushLoopOnce() {
 
       // use compressed data/len
       if (task->tensor_name[7] == 'G' && 
-          (task->context->compressor_name == "inca" ||
+          (task->context->compressor_name == "oldinca" || task->context->compressor_name == "inca" ||
            task->context->compressor_name == "terngrad")){
         dtype = BYTEPS_UINT8;
 
@@ -954,7 +954,7 @@ bool RunPullLoopOnce() {
     BPS_LOG(INFO) << "Pull Task Tensor: " << task->tensor_name << " key: " << task->key << " data to: " << (task->cpubuff) + offset << " len: " << len << " scale: " << task->scale << "\n";
 
     if (task->tensor_name[7] == 'G' && 
-        (task->context->compressor_name == "inca" ||
+        (task->context->compressor_name == "oldinca" || task->context->compressor_name == "inca" ||
          task->context->compressor_name == "terngrad")){
         dtype = BYTEPS_UINT8;
     }
