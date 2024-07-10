@@ -75,6 +75,20 @@ parser.add_argument('--max-val', type=int, default=30,
                     help='INCA max value')
 parser.add_argument('--table-dir', type=str, default='/home/byteps/byteps/torch/tables',
                     help='directory to store the tables')
+parser.add_argument('--uhc', action='store_true', default=False,
+                    help='use UHC compression during pushpull')
+parser.add_argument('--inca', action='store_true', default=False,
+                    help='use INCA (aka UHC) compression during pushpull')
+parser.add_argument('--rotation', action='store_true', default=False,
+                    help='use INCA compression with rotation')
+### minmax for INCA - percentile
+parser.add_argument('--percentile', default=1., type=float,
+                    help='the percentile to use for minmax quantization')
+### the maximum number of iterations if doing a partial rotation
+parser.add_argument('--partial', default=1000., type=int,
+                    help='the maximum number of iterations in the partial rotation')
+parser.add_argument('--norm-normal', action='store_true', default=False,
+                    help='use INCA compression with norm normalization')
 parser.add_argument('--overflow-prob', type=float, default=0.0001, metavar='P',
                     help='per_coordinate_overflow_prob')
 parser.add_argument('--topk', action='store_true', default=False,
@@ -174,18 +188,24 @@ quantization_levels['batch_grads'] = args.quant_level
 
 # BytePS: (optional) compression algorithm.
 if args.thc or args.new_inca:
-    compression = bps.Compression.newinca(params={'nclients': 1, 'd': pytorch_total_params_trainable, \
+    compression = bps.Compression.newinca(params={'nclients': bps.get_num_worker(), 'd': pytorch_total_params_trainable, \
         'ef': args.ef, 'quantization_levels': args.quant_level, 'seed': args.new_inca_seed, \
         'overflow_frequency': args.overflow_freq, 'max_val': args.max_val, 'table_dir': args.table_dir, \
         'use_bps_server': args.use_bps_server})
+elif (args.uhc or args.inca):
+    compression = bps.Compression.inca(params={'nclients': bps.get_num_worker(), 'd': pytorch_total_params_trainable, \
+        'ef': args.ef, 'rotation': args.rotation, 'quantization_levels': quantization_levels, \
+        'partial_rotation_times': args.partial, 'percentile': args.percentile, \
+        'norm_normalization': args.norm_normal, 'per_coordinate_overflow_prob': args.overflow_prob, \
+        'use_bps_server': args.use_bps_server})
 elif args.topk:
-    compression = bps.Compression.topk(params={'d': pytorch_total_params_trainable, \
+    compression = bps.Compression.topk(params={'nclients': bps.get_num_worker(), 'd': pytorch_total_params_trainable, \
         'ef': args.ef, 'kp': args.kp, 'use_bps_server': args.use_bps_server})
 elif args.terngrad:
-    compression = bps.Compression.terngrad(params={'d': pytorch_total_params_trainable,\
+    compression = bps.Compression.terngrad(params={'nclients': bps.get_num_worker(), 'd': pytorch_total_params_trainable,\
         'ef': args.ef, 'use_bps_server': args.use_bps_server})
 else:
-    compression = bps.Compression.fp16 if args.fp16_pushpull else bps.Compression.none()
+    compression = bps.Compression.fp16() if args.fp16_pushpull else bps.Compression.none()
 
 # BytePS: wrap optimizer with DistributedOptimizer.
 optimizer = bps.DistributedOptimizer(optimizer,
@@ -234,7 +254,6 @@ def train(epoch):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_sampler),
                 100. * batch_idx / len(train_loader), loss.item()))
-            print(time.time())
 
     train_accuracy /= len(train_sampler)
     if bps.rank() == 0:
