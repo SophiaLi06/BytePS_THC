@@ -170,11 +170,18 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
     quantization_levels['batch_grads'] = args.quant_level
     # BytePS: (optional) compression algorithm. 
     if args.thc or args.new_inca:
-        compression = hvd.Compression.newinca(params={'nclients': 1, 'd': pytorch_total_params_trainable, \
+        compression = hvd.Compression.newinca(params={'nclients': hvd.get_num_worker(), 'd': pytorch_total_params_trainable, \
             'ef': args.ef, 'quantization_levels': args.quant_level, 'seed': args.new_inca_seed, \
             'overflow_frequency': args.overflow_freq, 'max_val': args.max_val, 'table_dir': args.table_dir, \
             'use_bps_server': args.use_bps_server})
         compressor_name = "THC"
+    elif (args.uhc or args.inca):
+        compression = hvd.Compression.inca(params={'nclients': hvd.get_num_worker(), 'd': pytorch_total_params_trainable, \
+            'ef': args.ef, 'rotation': args.rotation, 'quantization_levels': quantization_levels, \
+            'partial_rotation_times': args.partial, 'percentile': args.percentile, \
+            'norm_normalization': args.norm_normal, 'per_coordinate_overflow_prob': args.overflow_prob, \
+            'use_bps_server': args.use_bps_server})
+        compressor_name = "UHC"
     elif args.dgc:
         compression = hvd.Compression.dgc(params={'d': pytorch_total_params_trainable, \
             'kp': args.kp, 'use_bps_server': args.use_bps_server})
@@ -188,7 +195,7 @@ def train(args, train_dataset, model, tokenizer) -> Tuple[int, float]:
             'use_bps_server': args.use_bps_server})
         compressor_name = "terngrad"
     else:
-        compression = hvd.Compression.fp16 if args.fp16_pushpull else hvd.Compression.none()
+        compression = hvd.Compression.fp16() if args.fp16_pushpull else hvd.Compression.none()
         
     optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters(), compression=compression,\
         backward_passes_per_step=args.gradient_accumulation_steps)
@@ -655,6 +662,21 @@ def main():
                     help='INCA max value')
     parser.add_argument('--table-dir', type=str, default='/home/byteps/byteps/torch/tables',
                     help='directory to store the tables')
+    ### UHC (aka old INCA) parameters
+    parser.add_argument('--uhc', action='store_true', default=False,
+                    help='use UHC compression during pushpull')
+    parser.add_argument('--inca', action='store_true', default=False,
+                    help='use old INCA (aka UHC) compression during pushpull')
+    parser.add_argument('--rotation', action='store_true', default=False,
+                    help='use INCA compression with rotation')
+    ### minmax for INCA - percentile
+    parser.add_argument('--percentile', default=1., type=float,
+                    help='the percentile to use for minmax quantization')
+    ### the maximum number of iterations if doing a partial rotation
+    parser.add_argument('--partial', default=1000., type=int,
+                    help='the maximum number of iterations in the partial rotation')
+    parser.add_argument('--norm-normal', action='store_true', default=False,
+                    help='use INCA compression with norm normalization')
     parser.add_argument('--overflow-prob', type=float, default=0.0001, metavar='P',
                     help='per_coordinate_overflow_prob')
     parser.add_argument('--dgc', action='store_true', default=False,
