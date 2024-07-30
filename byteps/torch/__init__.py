@@ -380,15 +380,27 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 contexts.append(ctx)
                 offset += slice_size
 
+            # batch_decompressed = []
+            # for i in range(len(compress_batch_handles)):
+            #     handle = compress_batch_handles[i]
+            #     output = synchronize(handle)
+            #     if not output.is_cuda:
+            #         print("WARNING: pulled tensor is not on CUDA")
+            #     contexts[i]['max_norms'] = max_norms[i]
+            #     contexts[i]['local_size'] = self.local_size
+            #     batch_decompressed.append(self._compression.decompress(output, contexts[i]))
+
+            batched_output = []
+            for handle in compress_batch_handles:
+                batched_output.append(synchronize(handle))
+            
             batch_decompressed = []
-            for i in range(len(compress_batch_handles)):
-                handle = compress_batch_handles[i]
-                output = synchronize(handle)
-                if not output.is_cuda:
+            for i in range(len(batched_output)):
+                if not batched_output[i].is_cuda:
                     print("WARNING: pulled tensor is not on CUDA")
                 contexts[i]['max_norms'] = max_norms[i]
                 contexts[i]['local_size'] = self.local_size
-                batch_decompressed.append(self._compression.decompress(output, contexts[i]))
+                batch_decompressed.append(self._compression.decompress(batched_output[i], contexts[i]))
 
             batch_decompressed = torch.cat(batch_decompressed)
 
